@@ -21,6 +21,7 @@ model.eval()
 
 
 def transcribe_audio(audio_path):
+    """تحويل الصوت إلى نص باستخدام Wav2Vec2"""
     speech, sr = librosa.load(audio_path, sr=16000)
     input_values = processor(speech, sampling_rate=16000, return_tensors="pt").input_values.to(device)
     with torch.no_grad():
@@ -30,6 +31,7 @@ def transcribe_audio(audio_path):
     return transcription
 
 def detect_pronunciation_errors(reference_text, predicted_text):
+    """مقارنة النص المرجعي بالنص المنطوق لتحديد الأحرف المخطأ فيها"""
     errors = []
     ref_chars = list(reference_text)
     pred_chars = list(predicted_text)
@@ -52,6 +54,7 @@ def detect_pronunciation_errors(reference_text, predicted_text):
 # =========================================================
 
 def extract_embedding(audio_path):
+   
     speech, sr = librosa.load(audio_path, sr=16000)
     input_values = processor(speech, sampling_rate=16000, return_tensors="pt").input_values.to(device)
     with torch.no_grad():
@@ -66,51 +69,58 @@ def compute_similarity(ref_emb, test_emb):
     similarities = [1 - cosine(r, t) for r, t in zip(ref_emb, test_emb)]
     return np.mean(similarities)
 
-def extract_speech_features(audio_path):
+def extract_speech_features(audio_path, ref_duration=None):
     snd = parselmouth.Sound(audio_path)
+    
+  
     pitch = snd.to_pitch()
     pitch_values = pitch.selected_array['frequency']
     mean_pitch = np.mean(pitch_values[pitch_values > 0]) if any(pitch_values > 0) else 0
+    
+
     intensity = snd.to_intensity()
     mean_intensity = np.mean(intensity.values)
-    return [mean_pitch, mean_intensity]
+    
+   
+    duration = snd.get_total_duration()
+    
 
+    norm_duration = duration / ref_duration if ref_duration else 1.0
+    
+    return [mean_pitch, mean_intensity, norm_duration]
 # =========================================================
 # 3. بناء مصفوفة البيانات (معدل ليدعم كلمات متعددة)
 # =========================================================
 
 def load_multi_word_dataset(dataset_path, references_folder):
-    X = []
-    y = []
-        
-    ref_embeddings = {}
-    print("جاري تجهيز البصمات الصوتية للمراجع (5 كلمات)...")
-    for i in range(1, 6): # الكلمات من 1 إلى 5
+    X, y = [], []
+    ref_data = {} 
+    
+    print("جاري تجهيز المراجع (البصمات والمدد الزمنية)...")
+    for i in range(1, 6):
         ref_path = os.path.join(references_folder, f"{i}.wav")
         if os.path.exists(ref_path):
-            ref_embeddings[str(i)] = extract_embedding(ref_path)
+            emb = extract_embedding(ref_path)
+            dur = parselmouth.Sound(ref_path).get_total_duration()
+            ref_data[str(i)] = {"emb": emb, "dur": dur}
 
-    print(f"جاري قراءة المجلدات للمتحدثين من {dataset_path}...")
-        
     for folder_name in os.listdir(dataset_path):
         folder_path = os.path.join(dataset_path, folder_name)
-        if os.path.isdir(folder_path):    
+        if os.path.isdir(folder_path):
             for file_name in os.listdir(folder_path):
-                if file_name.endswith(".wav"):                    
+                if file_name.endswith(".wav"):
                     word_id = file_name.replace("_N", "").replace(".wav", "")
-                    
-                    if word_id in ref_embeddings:
+                    if word_id in ref_data:
                         file_path = os.path.join(folder_path, file_name)
                         try:
                             emb = extract_embedding(file_path)
-                            sim = compute_similarity(ref_embeddings[word_id], emb)
-                            pitch, intensity = extract_speech_features(file_path)
+                            sim = compute_similarity(ref_data[word_id]["emb"], emb)
+                           
+                            pitch, intensity, norm_dur = extract_speech_features(file_path, ref_data[word_id]["dur"])
                             
-                            X.append([sim, pitch, intensity])                            
+                            X.append([sim, pitch, intensity, norm_dur])
                             y.append(1 if "_N" in file_name else 0)
-                        except Exception as e:
-                            print(f"خطأ في معالجة الملف {file_name}: {e}")
-
+                        except Exception as e: print(f"خطأ: {e}")
     return np.array(X), np.array(y)
 
 # =========================================================
@@ -118,9 +128,11 @@ def load_multi_word_dataset(dataset_path, references_folder):
 # =========================================================
 
 DATASET_PATH = "ASMDD_Dataset_Folders" 
+
 REFERENCES_FOLDER = "Reference_Voices" 
 
 X_train, y_train = load_multi_word_dataset(DATASET_PATH, REFERENCES_FOLDER)
+
 
 print("\n" + "="*30)
 print("التحقق من المصفوفات المستخرجة:")
@@ -141,10 +153,13 @@ print(f"- عدد النطق السليم: {len(y_train) - np.sum(y_train)}")
 print("="*30 + "\n")
 # ----------------------------
 
+
 if len(X_train) > 0:
 
+  
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
+
 
     print(f"تم تجميع {len(X_train)} عينة. جاري تدريب النموذج...")
     classifier = RandomForestClassifier(n_estimators=100, random_state=42)
@@ -166,12 +181,14 @@ def evaluate_speaker_complete(speaker_folder, references_folder):
     
     results = []
     
+    
     if not os.path.exists(speaker_folder):
         print(f"خطأ: المجلد {speaker_folder} غير موجود.")
         return
 
     for i in range(1, 6):
-        word_id = str(i)    
+        word_id = str(i)
+        # البحث عن الملف (سليم 1.wav أو اضطراب 1_N.wav)
         test_file = os.path.join(speaker_folder, f"{word_id}.wav")
         if not os.path.exists(test_file):
             test_file = os.path.join(speaker_folder, f"{word_id}_N.wav")
@@ -180,27 +197,33 @@ def evaluate_speaker_complete(speaker_folder, references_folder):
             ref_file = os.path.join(references_folder, f"{word_id}.wav")
             
             if os.path.exists(ref_file):
-                try:                 
+                try:
+                    ref_snd = parselmouth.Sound(ref_file)
+                    ref_dur = ref_snd.get_total_duration()
+
+
                     emb_test = extract_embedding(test_file)
                     emb_ref = extract_embedding(ref_file)
                     
                     sim = compute_similarity(emb_ref, emb_test)
-                    pitch, intensity = extract_speech_features(test_file)
-                                        
-                    sample = scaler.transform([[sim, pitch, intensity]])
+                    pitch, intensity, norm_dur = extract_speech_features(test_file, ref_dur)                    
+
+                    sample = scaler.transform([[sim, pitch, intensity, norm_dur]])
                     prediction = classifier.predict(sample)[0]
                     
-                    ref_text = transcribe_audio(ref_file)
-                    pred_text = transcribe_audio(test_file)
+
+                    ref_text = transcribe_audio(ref_file) # النص السليم من المرجع
+                    pred_text = transcribe_audio(test_file) # ما قاله الطفل فعلياً
                     char_errors = detect_pronunciation_errors(ref_text, pred_text)
-                    
+
+                   
                     status = "⚠️ اضطراب نطق" if prediction == 1 else "✅ نطق سليم"
                     print(f"الكلمة {word_id}: {status.ljust(15)} | التشابه الصوتي: {sim*100:.2f}%")
 
                     if char_errors:
                         print(f"   ∟ أخطاء الحروف المكتشفة: {', '.join(char_errors)}")
                     else:
-                        print(f"   ∟ لا توجد أخطاء في الأحرف.")
+                        pri4nt(f"   ∟ لا توجد أخطاء في الأحرف.") # اختيارية
 
 
                     results.append(prediction)
@@ -210,6 +233,7 @@ def evaluate_speaker_complete(speaker_folder, references_folder):
                 print(f"تنبيه: ملف المرجع {word_id}.wav غير موجود في مجلد المراجع.")
         else:
             print(f"الكلمة {word_id}: ملف الصوت غير موجود في مجلد الطفل.")
+
     
     if results:
         error_count = sum(results)
@@ -231,7 +255,9 @@ def evaluate_speaker_complete(speaker_folder, references_folder):
 # استدعاء الفحص (تغيير المسارات حسب مجلداتك)
 # ==========================================
 
+
 my_test_folder = "Test_Child" 
+
 
 if os.path.exists(my_test_folder):
     evaluate_speaker_complete(my_test_folder, REFERENCES_FOLDER)
